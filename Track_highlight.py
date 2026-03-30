@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 
-DEFAULT_INPUT_VIDEO = r"F:/Tongji/Sci/Video/VID_20260324_155114.mp4"
+DEFAULT_INPUT_VIDEO = r"F:/Tongji/Sci/Video/Tracking/VID_20260324_155114.mp4"
 DEFAULT_OUTPUT_VIDEO = r"highlight_overlay.mp4"
 
 
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=int, default=220, help="Binary threshold for bright marker detection (0-255).")
     parser.add_argument("--blur", type=int, default=0, help="Gaussian blur kernel size; use odd integer, 0 to disable.")
     parser.add_argument("--min_area", type=float, default=50.0, help="Minimum contour area to keep.")
-    parser.add_argument("--max_area", type=float, default=5000.0, help="Maximum contour area to keep.")
+    parser.add_argument("--max_area", type=float, default=6000.0, help="Maximum contour area to keep.")
     parser.add_argument("--fps_out", type=float, default=0.0, help="Output video FPS; 0 means same as input.")
     parser.add_argument("--codec", default="mp4v", help="FourCC codec for output video, e.g. mp4v, XVID.")
     parser.add_argument("--show", action="store_true", help="Display live preview window.")
