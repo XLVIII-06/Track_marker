@@ -1,49 +1,50 @@
 """
-pipeline.py
+End-to-end 2D marker mocap pipeline.
 
-用途：
-- 串联整个 2D 动作捕捉流程
-    视频 -> 去畸变 -> 亮点检测 -> trackpy 跨帧关联 -> 坐标转换 -> 保存 CSV -> 输出标注视频
+Flow:
+video -> homography calibration -> undistortion -> marker detection ->
+track linking -> pixel-to-world transform -> CSV/video outputs.
 """
 
 import argparse
+from pathlib import Path
 
-import cv2
 import numpy as np
-import pandas as pd
 
 try:
+    from tqdm import tqdm
+except ImportError as exc:
+    raise ImportError("tqdm is required for progress output. Install it with 'pip install tqdm'.") from exc
+
+try:
+    from .calibration_homography import (
+        DEFAULT_PATTERN_SIZE,
+        DEFAULT_SQUARE_SIZE,
+        calibrate_homography_from_video,
+    )
     from .detection import detect_markers
+    from .output import save_tracking_csv, write_annotated_video
+    from .roi import resolve_roi
     from .tracking import link_markers
     from .transform import CoordinateTransformer
     from .undistort import Undistorter
+    from .video_io import extract_frame, get_video_properties, open_video
 except ImportError:
+    from calibration_homography import (
+        DEFAULT_PATTERN_SIZE,
+        DEFAULT_SQUARE_SIZE,
+        calibrate_homography_from_video,
+    )
     from detection import detect_markers
+    from output import save_tracking_csv, write_annotated_video
+    from roi import resolve_roi
     from tracking import link_markers
     from transform import CoordinateTransformer
     from undistort import Undistorter
+    from video_io import extract_frame, get_video_properties, open_video
 
 
-def _open_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Could not open video: {video_path}")
-    return cap
-
-
-def _get_video_properties(cap):
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if fps <= 0:
-        fps = 30.0
-
-    return fps, width, height, frame_count
-
-
-def _compute_world_coordinates(tracking_df, transformer):
+def compute_world_coordinates(tracking_df, transformer):
     tracking_df = tracking_df.copy()
     tracking_df["X_mm"] = np.nan
     tracking_df["Y_mm"] = np.nan
@@ -60,151 +61,145 @@ def _compute_world_coordinates(tracking_df, transformer):
     return tracking_df
 
 
-def _build_overlay_lines(frame_idx, frame_rows, num_markers):
-    lines = [f"Frame {frame_idx}"]
-    frame_rows = frame_rows.set_index("particle_id")
-
-    for particle_id in range(num_markers):
-        if particle_id in frame_rows.index:
-            row = frame_rows.loc[particle_id]
-            if bool(row["detected"]):
-                lines.append(
-                    "ID {pid}: uv=({u:.1f}, {v:.1f}) XY=({X:.1f}, {Y:.1f})".format(
-                        pid=particle_id,
-                        u=row["u"],
-                        v=row["v"],
-                        X=row["X_mm"],
-                        Y=row["Y_mm"],
-                    )
-                )
-            else:
-                lines.append(f"ID {particle_id}: missing")
-        else:
-            lines.append(f"ID {particle_id}: missing")
-
-    return lines
-
-
-def _draw_overlay(frame, lines):
-    overlay = frame.copy()
-    margin = 10
-    line_height = 20
-    width = 520
-    height = margin * 2 + line_height * len(lines)
-
-    cv2.rectangle(overlay, (5, 5), (5 + width, 5 + height), (0, 0, 0), thickness=-1)
-    frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
-
-    for index, line in enumerate(lines):
-        origin = (margin + 5, margin + 20 + index * line_height)
-        cv2.putText(
-            frame,
-            line,
-            origin,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-    return frame
-
-
-def _draw_markers(frame, frame_rows, colors):
-    for _, row in frame_rows.iterrows():
-        if not bool(row["detected"]):
-            continue
-
-        center = (int(round(row["u"])), int(round(row["v"])))
-        particle_id = int(row["particle_id"])
-        color = colors[particle_id % len(colors)]
-
-        cv2.circle(frame, center, 8, color, 2)
-        cv2.putText(
-            frame,
-            f"ID {particle_id}",
-            (center[0] + 10, center[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-
-    return frame
-
-
-def _write_annotated_video(
+def resolve_homography_path(
     video_path,
     intrinsics_path,
-    tracking_df,
-    output_video,
-    num_markers,
-    codec="mp4v",
+    output_dir,
+    homography_path=None,
+    homography_frame=0,
+    pattern_size=DEFAULT_PATTERN_SIZE,
+    square_size=DEFAULT_SQUARE_SIZE,
+    force_homography=False,
 ):
-    cap = _open_video(video_path)
-    fps, width, height, _ = _get_video_properties(cap)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    writer = cv2.VideoWriter(
-        output_video,
-        cv2.VideoWriter_fourcc(*codec),
-        fps,
-        (width, height),
+    if homography_path is not None:
+        homography_path = Path(homography_path)
+        if not homography_path.exists():
+            raise FileNotFoundError(f"Homography file not found: {homography_path}")
+        return homography_path
+
+    generated_path = output_dir / "homography.json"
+    debug_image_path = output_dir / "homography_frame_corners.png"
+
+    if generated_path.exists() and not force_homography:
+        return generated_path
+
+    calibrate_homography_from_video(
+        video_path=video_path,
+        intrinsics_path=intrinsics_path,
+        frame_index=homography_frame,
+        pattern_size=pattern_size,
+        square_size=square_size,
+        save_path=generated_path,
+        debug_image_path=debug_image_path,
     )
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Could not open video writer: {output_video}")
-
-    undistorter = Undistorter(intrinsics_path)
-    frame_groups = {
-        frame_idx: rows.copy()
-        for frame_idx, rows in tracking_df.groupby("frame", sort=True)
-    }
-
-    colors = [
-        (0, 255, 0),
-        (0, 255, 255),
-        (255, 255, 0),
-        (255, 0, 255),
-        (0, 128, 255),
-        (255, 128, 0),
-        (128, 255, 0),
-        (255, 0, 128),
-    ]
-
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame = undistorter.undistort(frame)
-        frame_rows = frame_groups.get(frame_idx)
-        if frame_rows is None:
-            frame_rows = pd.DataFrame(columns=tracking_df.columns)
-
-        frame = _draw_markers(frame, frame_rows, colors)
-        overlay_lines = _build_overlay_lines(frame_idx, frame_rows, num_markers)
-        frame = _draw_overlay(frame, overlay_lines)
-        writer.write(frame)
-        frame_idx += 1
-
-    writer.release()
-    cap.release()
+    return generated_path
 
 
-def run_pipeline(
+def collect_detections(
     video_path,
     intrinsics_path,
-    homography_path,
-    output_csv="output.csv",
-    output_video="annotated_output.mp4",
     num_markers=5,
     detection_threshold=200,
     detection_min_area=5.0,
     detection_max_area=None,
     blur_kernel_size=5,
+    roi=None,
+    min_circularity=0.5,
+    local_bg_radius=12,
+    local_peak_weight=1.0,
+    local_contrast_weight=2.0,
+):
+    cap = open_video(video_path)
+    try:
+        _, _, _, frame_count = get_video_properties(cap)
+        undistorter = Undistorter(intrinsics_path)
+        detections = []
+        frame_idx = 0
+
+        progress = tqdm(
+            total=frame_count if frame_count > 0 else None,
+            desc="Detecting markers",
+            unit="frame",
+        )
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = undistorter.undistort(frame)
+                frame_detections = detect_markers(
+                    frame,
+                    num_markers=num_markers,
+                    threshold=detection_threshold,
+                    min_area=detection_min_area,
+                    max_area=detection_max_area,
+                    blur_kernel_size=blur_kernel_size,
+                    roi=roi,
+                    min_circularity=min_circularity,
+                    local_bg_radius=local_bg_radius,
+                    local_peak_weight=local_peak_weight,
+                    local_contrast_weight=local_contrast_weight,
+                    return_metadata=True,
+                )
+
+                for detection in frame_detections:
+                    detections.append({"frame": frame_idx, **detection})
+
+                frame_idx += 1
+                progress.update(1)
+        finally:
+            progress.close()
+
+        num_frames = frame_idx if frame_idx > 0 else frame_count
+        return detections, num_frames
+    finally:
+        cap.release()
+
+
+def prepare_roi(
+    video_path,
+    intrinsics_path,
+    output_dir,
+    roi=None,
+    interactive_roi=True,
+    force_roi=False,
+):
+    frame = extract_frame(video_path, frame_index=0)
+    frame = Undistorter(intrinsics_path).undistort(frame)
+    return resolve_roi(
+        output_dir=output_dir,
+        frame=frame,
+        roi=roi,
+        interactive_roi=interactive_roi,
+        force_roi=force_roi,
+    )
+
+
+def run_pipeline(
+    video_path,
+    intrinsics_path,
+    output_dir="outputs",
+    homography_path=None,
+    homography_frame=0,
+    pattern_size=DEFAULT_PATTERN_SIZE,
+    square_size=DEFAULT_SQUARE_SIZE,
+    force_homography=False,
+    num_markers=5,
+    detection_threshold=200,
+    detection_min_area=5.0,
+    detection_max_area=None,
+    blur_kernel_size=5,
+    roi=None,
+    interactive_roi=True,
+    force_roi=False,
+    min_circularity=0.5,
+    local_bg_radius=12,
+    local_peak_weight=1.0,
+    local_contrast_weight=2.0,
     track_search_range=50,
     track_memory=5,
     video_codec="mp4v",
@@ -212,44 +207,50 @@ def run_pipeline(
     if num_markers <= 0:
         raise ValueError("num_markers must be a positive integer.")
 
-    cap = _open_video(video_path)
-    _, _, _, frame_count = _get_video_properties(cap)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_csv = output_dir / "tracking.csv"
+    output_video = output_dir / "annotated_output.mp4"
 
-    undistorter = Undistorter(intrinsics_path)
-    transformer = CoordinateTransformer(homography_path)
+    print("Resolving homography...")
+    resolved_homography_path = resolve_homography_path(
+        video_path=video_path,
+        intrinsics_path=intrinsics_path,
+        output_dir=output_dir,
+        homography_path=homography_path,
+        homography_frame=homography_frame,
+        pattern_size=pattern_size,
+        square_size=square_size,
+        force_homography=force_homography,
+    )
 
-    detections = []
-    frame_idx = 0
+    print("Resolving ROI...")
+    resolved_roi, roi_path = prepare_roi(
+        video_path=video_path,
+        intrinsics_path=intrinsics_path,
+        output_dir=output_dir,
+        roi=roi,
+        interactive_roi=interactive_roi,
+        force_roi=force_roi,
+    )
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    print("Detecting markers...")
+    detections, num_frames = collect_detections(
+        video_path=video_path,
+        intrinsics_path=intrinsics_path,
+        num_markers=num_markers,
+        detection_threshold=detection_threshold,
+        detection_min_area=detection_min_area,
+        detection_max_area=detection_max_area,
+        blur_kernel_size=blur_kernel_size,
+        roi=resolved_roi,
+        min_circularity=min_circularity,
+        local_bg_radius=local_bg_radius,
+        local_peak_weight=local_peak_weight,
+        local_contrast_weight=local_contrast_weight,
+    )
 
-        frame = undistorter.undistort(frame)
-        frame_detections = detect_markers(
-            frame,
-            num_markers=num_markers,
-            threshold=detection_threshold,
-            min_area=detection_min_area,
-            max_area=detection_max_area,
-            blur_kernel_size=blur_kernel_size,
-            return_metadata=True,
-        )
-
-        for detection in frame_detections:
-            detections.append(
-                {
-                    "frame": frame_idx,
-                    **detection,
-                }
-            )
-
-        frame_idx += 1
-
-    cap.release()
-    num_frames = frame_idx if frame_idx > 0 else frame_count
-
+    print("Linking tracks...")
     tracking_df = link_markers(
         detections=detections,
         num_frames=num_frames,
@@ -257,18 +258,26 @@ def run_pipeline(
         search_range=track_search_range,
         memory=track_memory,
     )
-    tracking_df = _compute_world_coordinates(tracking_df, transformer)
+    print("Computing world coordinates...")
+    tracking_df = compute_world_coordinates(
+        tracking_df,
+        CoordinateTransformer(resolved_homography_path),
+    )
 
-    tracking_df.to_csv(output_csv, index=False)
-    _write_annotated_video(
+    print("Writing outputs...")
+    save_tracking_csv(tracking_df, output_csv)
+    write_annotated_video(
         video_path=video_path,
         intrinsics_path=intrinsics_path,
         tracking_df=tracking_df,
         output_video=output_video,
         num_markers=num_markers,
         codec=video_codec,
+        roi=resolved_roi,
     )
 
+    print("Saved homography:", resolved_homography_path)
+    print("Saved ROI:", roi_path)
     print("Saved CSV:", output_csv)
     print("Saved annotated video:", output_video)
     return tracking_df
@@ -276,33 +285,63 @@ def run_pipeline(
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Run the full mocap2d pipeline on a video."
+        description="Run the full 2D marker mocap pipeline on a video."
     )
-    parser.add_argument("--video", required=True, help="Input video path.")
+    parser.add_argument(
+        "--video",
+        default=r"F:\Tongji\Sci\Video\Tracking\DSCF8178.mov",
+        # required=True,
+        help="Input .mov/.mp4 video path.",
+    )
     parser.add_argument(
         "--intrinsics-path",
-        required=True,
+        default=r"intrinsics.json",
+        # required=True,
         help="Path to intrinsics.json.",
     )
     parser.add_argument(
+        "--output-dir",
+        default="outputs",
+        help="Directory for tracking.csv, annotated_output.mp4, and generated homography files.",
+    )
+    parser.add_argument(
         "--homography-path",
-        required=True,
-        help="Path to homography.json.",
+        default=None,
+        help="Optional existing homography.json. If omitted, output-dir/homography.json is generated or reused.",
     )
     parser.add_argument(
-        "--output-csv",
-        default="output.csv",
-        help="Path to save tracking results CSV.",
+        "--force-homography",
+        action="store_true",
+        help="Recompute output-dir/homography.json even if it already exists.",
     )
     parser.add_argument(
-        "--output-video",
-        default="annotated_output.mp4",
-        help="Path to save the annotated output video.",
+        "--homography-frame",
+        type=int,
+        default=0,
+        help="Video frame index used for homography calibration.",
+    )
+    parser.add_argument(
+        "--pattern-cols",
+        type=int,
+        default=DEFAULT_PATTERN_SIZE[0],
+        help="Number of inner corners along the chessboard width.",
+    )
+    parser.add_argument(
+        "--pattern-rows",
+        type=int,
+        default=DEFAULT_PATTERN_SIZE[1],
+        help="Number of inner corners along the chessboard height.",
+    )
+    parser.add_argument(
+        "--square-size",
+        type=float,
+        default=DEFAULT_SQUARE_SIZE,
+        help="Chessboard square size in mm.",
     )
     parser.add_argument(
         "--num-markers",
         type=int,
-        default=5,
+        default=4,
         help="Number of reflective markers to track.",
     )
     parser.add_argument(
@@ -330,6 +369,50 @@ def _parse_args():
         help="Gaussian blur kernel size used before thresholding.",
     )
     parser.add_argument(
+        "--roi",
+        type=int,
+        nargs=4,
+        metavar=("X", "Y", "W", "H"),
+        default=None,
+        help="Detection ROI in undistorted full-frame coordinates.",
+    )
+    parser.add_argument(
+        "--interactive-roi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Select ROI interactively on each run unless --roi is provided. "
+        "With --no-interactive-roi, use cached output-dir/roi.json if available.",
+    )
+    parser.add_argument(
+        "--force-roi",
+        action="store_true",
+        help="Deprecated compatibility option. ROI is selected interactively by default.",
+    )
+    parser.add_argument(
+        "--min-circularity",
+        type=float,
+        default=0.5,
+        help="Minimum contour circularity for marker candidates.",
+    )
+    parser.add_argument(
+        "--local-bg-radius",
+        type=int,
+        default=12,
+        help="Radius around each blob used to estimate local background intensity.",
+    )
+    parser.add_argument(
+        "--local-peak-weight",
+        type=float,
+        default=1.0,
+        help="Weight for max intensity in local peak scoring.",
+    )
+    parser.add_argument(
+        "--local-contrast-weight",
+        type=float,
+        default=2.0,
+        help="Weight for local contrast in local peak scoring.",
+    )
+    parser.add_argument(
         "--track-search-range",
         type=float,
         default=50,
@@ -354,14 +437,24 @@ if __name__ == "__main__":
     run_pipeline(
         video_path=args.video,
         intrinsics_path=args.intrinsics_path,
+        output_dir=args.output_dir,
         homography_path=args.homography_path,
-        output_csv=args.output_csv,
-        output_video=args.output_video,
+        homography_frame=args.homography_frame,
+        pattern_size=(args.pattern_cols, args.pattern_rows),
+        square_size=args.square_size,
+        force_homography=args.force_homography,
         num_markers=args.num_markers,
         detection_threshold=args.detection_threshold,
         detection_min_area=args.detection_min_area,
         detection_max_area=args.detection_max_area,
         blur_kernel_size=args.blur_kernel_size,
+        roi=args.roi,
+        interactive_roi=args.interactive_roi,
+        force_roi=args.force_roi,
+        min_circularity=args.min_circularity,
+        local_bg_radius=args.local_bg_radius,
+        local_peak_weight=args.local_peak_weight,
+        local_contrast_weight=args.local_contrast_weight,
         track_search_range=args.track_search_range,
         track_memory=args.track_memory,
         video_codec=args.video_codec,

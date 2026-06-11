@@ -1,25 +1,29 @@
 """
-calibration_homography.py
-
-用途：
-- 根据图像中的标定点计算 homography 矩阵 H
-- 用于像素坐标 -> 实验平面坐标(mm)
-- 支持脚本直接运行，从棋盘格图像自动提取 image_points
+Homography calibration for mapping image pixels to planar world coordinates.
 """
 
 import argparse
 import json
+from pathlib import Path
 
 import cv2
 import numpy as np
 
+try:
+    from .output import save_chessboard_debug_image
+    from .undistort import Undistorter
+    from .video_io import extract_frame
+except ImportError:
+    from output import save_chessboard_debug_image
+    from undistort import Undistorter
+    from video_io import extract_frame
+
+
+DEFAULT_PATTERN_SIZE = (11, 8)
+DEFAULT_SQUARE_SIZE = 3.0
+
 
 def compute_homography(image_points, world_points, save_path="homography.json"):
-    """
-    image_points: [(u, v), ...]
-    world_points: [(X, Y), ...]，单位 mm
-    """
-
     img_pts = np.array(image_points, dtype=np.float32)
     world_pts = np.array(world_points, dtype=np.float32)
 
@@ -43,51 +47,29 @@ def compute_homography(image_points, world_points, save_path="homography.json"):
         "world_points": world_pts.tolist(),
     }
 
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-    print("Homography saved to", save_path)
     return H
 
 
-def _build_world_points(pattern_size, square_size):
+def build_world_points(pattern_size, square_size):
     world_points = np.zeros((pattern_size[0] * pattern_size[1], 2), np.float32)
-    world_points[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
+    world_points[:, :2] = np.mgrid[0 : pattern_size[0], 0 : pattern_size[1]].T.reshape(-1, 2)
     world_points *= square_size
     return world_points
 
 
-def _load_intrinsics(intrinsics_path):
-    with open(intrinsics_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    K = np.array(data["K"], dtype=np.float32)
-    dist = np.array(data["dist"], dtype=np.float32)
-    return K, dist
-
-
-def calibrate_homography_from_chessboard(
-    image_path,
-    pattern_size=(8, 6),
-    square_size=10.0,
-    save_path="homography.json",
-    intrinsics_path=None,
-    show_corners=False,
-):
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
-
-    if intrinsics_path is not None:
-        K, dist = _load_intrinsics(intrinsics_path)
-        image = cv2.undistort(image, K, dist)
-
+def find_chessboard_points(image, pattern_size):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     found, corners = cv2.findChessboardCorners(gray, pattern_size, None)
 
     if not found:
         raise RuntimeError(
-            "Chessboard corners were not found. Check the image, pattern size, and lighting."
+            "Chessboard corners were not found. Check --homography-frame, "
+            "--pattern-cols, --pattern-rows, --square-size, and lighting."
         )
 
     criteria = (
@@ -102,15 +84,77 @@ def calibrate_homography_from_chessboard(
         zeroZone=(-1, -1),
         criteria=criteria,
     )
+    return refined_corners
 
+
+def calibrate_homography_from_frame(
+    frame,
+    pattern_size=DEFAULT_PATTERN_SIZE,
+    square_size=DEFAULT_SQUARE_SIZE,
+    save_path="homography.json",
+    debug_image_path=None,
+):
+    refined_corners = find_chessboard_points(frame, pattern_size)
     image_points = refined_corners.reshape(-1, 2)
-    world_points = _build_world_points(pattern_size, square_size)
+    world_points = build_world_points(pattern_size, square_size)
 
     H = compute_homography(image_points, world_points, save_path=save_path)
 
+    if debug_image_path is not None:
+        save_chessboard_debug_image(frame, pattern_size, refined_corners, debug_image_path)
+
+    return H
+
+
+def calibrate_homography_from_video(
+    video_path,
+    intrinsics_path,
+    frame_index=0,
+    pattern_size=DEFAULT_PATTERN_SIZE,
+    square_size=DEFAULT_SQUARE_SIZE,
+    save_path="homography.json",
+    debug_image_path=None,
+):
+    frame = extract_frame(video_path, frame_index=frame_index)
+    undistorter = Undistorter(intrinsics_path)
+    undistorted_frame = undistorter.undistort(frame)
+
+    return calibrate_homography_from_frame(
+        undistorted_frame,
+        pattern_size=pattern_size,
+        square_size=square_size,
+        save_path=save_path,
+        debug_image_path=debug_image_path,
+    )
+
+
+def calibrate_homography_from_chessboard(
+    image_path,
+    pattern_size=DEFAULT_PATTERN_SIZE,
+    square_size=DEFAULT_SQUARE_SIZE,
+    save_path="homography.json",
+    intrinsics_path=None,
+    show_corners=False,
+    debug_image_path=None,
+):
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+
+    if intrinsics_path is not None:
+        image = Undistorter(intrinsics_path).undistort(image)
+
+    refined_corners = find_chessboard_points(image, pattern_size)
+    image_points = refined_corners.reshape(-1, 2)
+    world_points = build_world_points(pattern_size, square_size)
+    H = compute_homography(image_points, world_points, save_path=save_path)
+
+    if debug_image_path is not None:
+        save_chessboard_debug_image(image, pattern_size, refined_corners, debug_image_path)
+
     if show_corners:
         preview = image.copy()
-        cv2.drawChessboardCorners(preview, pattern_size, refined_corners, found)
+        cv2.drawChessboardCorners(preview, pattern_size, refined_corners, True)
         cv2.imshow("homography_calibration", preview)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
@@ -120,29 +164,39 @@ def calibrate_homography_from_chessboard(
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Compute homography from a chessboard calibration image."
+        description="Compute homography from a chessboard image or a selected video frame."
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", help="Path to a chessboard calibration image.")
+    source.add_argument("--video", help="Path to a video containing a chessboard frame.")
+    parser.add_argument(
+        "--intrinsics-path",
+        default=None,
+        help="Path to intrinsics.json. Required when using --video; optional for --image.",
     )
     parser.add_argument(
-        "--image",
-        required=True,
-        help="Path to the chessboard image used for homography calibration.",
+        "--frame-index",
+        "--homography-frame",
+        type=int,
+        default=0,
+        help="Video frame index used for homography calibration.",
     )
     parser.add_argument(
         "--pattern-cols",
         type=int,
-        default=8,
+        default=DEFAULT_PATTERN_SIZE[0],
         help="Number of inner corners along the chessboard width.",
     )
     parser.add_argument(
         "--pattern-rows",
         type=int,
-        default=6,
+        default=DEFAULT_PATTERN_SIZE[1],
         help="Number of inner corners along the chessboard height.",
     )
     parser.add_argument(
         "--square-size",
         type=float,
-        default=10.0,
+        default=DEFAULT_SQUARE_SIZE,
         help="Chessboard square size in mm.",
     )
     parser.add_argument(
@@ -151,25 +205,41 @@ def _parse_args():
         help="Path to save the computed homography JSON file.",
     )
     parser.add_argument(
-        "--intrinsics-path",
+        "--debug-image-path",
         default=None,
-        help="Optional intrinsics JSON path used to undistort the image first.",
+        help="Optional path to save a chessboard corner preview image.",
     )
     parser.add_argument(
         "--show-corners",
         action="store_true",
-        help="Display the detected chessboard corners before exiting.",
+        help="Display detected corners when using --image.",
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    calibrate_homography_from_chessboard(
-        image_path=args.image,
-        pattern_size=(args.pattern_cols, args.pattern_rows),
-        square_size=args.square_size,
-        save_path=args.save_path,
-        intrinsics_path=args.intrinsics_path,
-        show_corners=args.show_corners,
-    )
+    pattern_size = (args.pattern_cols, args.pattern_rows)
+
+    if args.video:
+        if args.intrinsics_path is None:
+            raise SystemExit("--intrinsics-path is required when using --video.")
+        calibrate_homography_from_video(
+            video_path=args.video,
+            intrinsics_path=args.intrinsics_path,
+            frame_index=args.frame_index,
+            pattern_size=pattern_size,
+            square_size=args.square_size,
+            save_path=args.save_path,
+            debug_image_path=args.debug_image_path,
+        )
+    else:
+        calibrate_homography_from_chessboard(
+            image_path=args.image,
+            pattern_size=pattern_size,
+            square_size=args.square_size,
+            save_path=args.save_path,
+            intrinsics_path=args.intrinsics_path,
+            show_corners=args.show_corners,
+            debug_image_path=args.debug_image_path,
+        )

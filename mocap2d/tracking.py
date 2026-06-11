@@ -25,6 +25,9 @@ TRACKING_COLUMNS = [
     "brightness",
     "mean_intensity",
     "max_intensity",
+    "circularity",
+    "local_contrast",
+    "score",
     "trackpy_particle",
     "detected",
 ]
@@ -51,6 +54,9 @@ def _empty_tracking_dataframe(num_frames, num_markers):
                     "brightness": np.nan,
                     "mean_intensity": np.nan,
                     "max_intensity": np.nan,
+                    "circularity": np.nan,
+                    "local_contrast": np.nan,
+                    "score": np.nan,
                     "trackpy_particle": np.nan,
                     "detected": False,
                 }
@@ -129,8 +135,15 @@ def link_markers(
         "brightness",
         "mean_intensity",
         "max_intensity",
+        "circularity",
+        "local_contrast",
+        "score",
         "trackpy_particle",
     ]
+
+    for column in value_columns:
+        if column not in filtered.columns:
+            filtered[column] = np.nan
 
     frame_particle_index = pd.MultiIndex.from_product(
         [range(num_frames), range(num_markers)],

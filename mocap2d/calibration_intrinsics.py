@@ -15,7 +15,7 @@ import numpy as np
 import glob
 import json
 
-def calibrate_intrinsics(image_folder, pattern_size=(8,6), square_size=10.0, save_path="intrinsics.json"):
+def calibrate_intrinsics(image_folder, pattern_size=(11,8), square_size=3.0, save_path="intrinsics.json"):
     # 准备棋盘格世界坐标
     objp = np.zeros((pattern_size[0]*pattern_size[1],3), np.float32)
     objp[:,:2] = np.mgrid[0:pattern_size[0],0:pattern_size[1]].T.reshape(-1,2)
@@ -53,4 +53,4 @@ def calibrate_intrinsics(image_folder, pattern_size=(8,6), square_size=10.0, sav
     print("Intrinsic calibration saved to", save_path)
 
 if __name__ == "__main__":
-    calibrate_intrinsics("chessboard_images")
+    calibrate_intrinsics("F:\Tongji\Sci\Pictures\Tracking\calibration_intrinsics")  # chessboard_images folder should contain the calibration images of chessboard patterns.
